@@ -6,7 +6,7 @@ import {
   ScrollView,
   TextInput as ModalTextInput,
 } from "@getpaseo/plugin/client/react-native";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ActivityIndicator,
   PanResponder,
@@ -60,6 +60,8 @@ const NARROW_TURN_LABEL_WIDTH = 380;
 const INITIAL_RENDER_ROWS = 1000;
 /** Safety reveal for the hidden-until-tail-positioned ledger. */
 const TAIL_REVEAL_FALLBACK_MS = 400;
+/** Viewport-top fraction that pages older history in (scroll-event detector). */
+const LOAD_OLDER_TOP_FRACTION = 0.4;
 
 type InspectorPlacement = "side" | "bottom";
 
@@ -414,6 +416,10 @@ function TrajectoryLedger({
   const trajectory = useTrajectory(agentId);
   const { rows, refresh, revision } = trajectory;
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  // Read-through refs so the press handlers below stay stable: memoized rows
+  // and markers then skip re-rendering when only the selection moves.
+  const selectedKeyRef = useRef(selectedKey);
+  selectedKeyRef.current = selectedKey;
   const [searchQuery, setSearchQuery] = useState("");
   const search = useTrajectorySearch(agentId, searchQuery, revision);
   // Steps whose tool calls are folded behind a summary row, keyed by
@@ -503,6 +509,9 @@ function TrajectoryLedger({
   const listHeightRef = useRef(0);
   const contentHeightRef = useRef(0);
   const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Content height the last older-page load fired at (see onScroll): native
+  // RN has no `onStartReached`, so paging is driven from the scroll event.
+  const startLoadHeightRef = useRef<number | null>(null);
   const revealTail = useCallback(() => {
     if (revealTimerRef.current !== null) {
       clearTimeout(revealTimerRef.current);
@@ -595,9 +604,14 @@ function TrajectoryLedger({
       followRef.current = true;
       listRef.current?.scrollToEnd({ animated: false });
       // A page that fits the viewport never scrolls (no event fires), and a
-      // lost scroll event must not leave the ledger hidden: reveal regardless.
+      // lost scroll event must not leave the ledger hidden: reveal — after
+      // one last snap attempt, for platforms where the initial scroll raced
+      // layout (the follow chain is unpinned by the reveal).
       if (revealTimerRef.current !== null) clearTimeout(revealTimerRef.current);
-      revealTimerRef.current = setTimeout(revealTail, TAIL_REVEAL_FALLBACK_MS);
+      revealTimerRef.current = setTimeout(() => {
+        listRef.current?.scrollToEnd({ animated: false });
+        revealTail();
+      }, TAIL_REVEAL_FALLBACK_MS);
     }
   }, [trajectory.loading, rows.length, revealTail]);
 
@@ -633,6 +647,8 @@ function TrajectoryLedger({
     () => buildDisplayRows(rows, { filtering, matchKeys, collapsedTurns, collapsedToolSteps }),
     [rows, filtering, matchKeys, collapsedTurns, collapsedToolSteps],
   );
+  const displayRowsRef = useRef(displayRows);
+  displayRowsRef.current = displayRows;
   // Rows re-render when the selection changes.
   const listExtraData = useMemo(
     () => ({ selectedKey, collapsedToolSteps, collapsedTurns }),
@@ -645,19 +661,22 @@ function TrajectoryLedger({
     initialRenderRowsRef.current = Math.min(displayRows.length, INITIAL_RENDER_ROWS);
   }
 
-  /** Selects a timeline marker, opening the inspector and revealing its row. */
-  const focusRecord = useCallback(
-    (key: string) => {
-      const alreadySelected = selectedKey === key;
-      setSelectedKey(alreadySelected ? null : key);
-      if (alreadySelected) return;
-      const index = displayRows.findIndex((row) => row.key === key);
-      if (index < 0) return;
-      // Let the selection render (and any fold expansion settle) first.
-      setTimeout(() => listRef.current?.scrollToIndex({ index, animated: true, viewPosition: 0.5 }), 0);
-    },
-    [selectedKey, displayRows],
-  );
+  /** Row tap: toggles selection. Stable so memoized rows skip re-rendering. */
+  const handleRowPress = useCallback((key: string) => {
+    setSelectedKey((current) => (current === key ? null : key));
+  }, []);
+
+  /** Selects a timeline marker, opening the inspector and revealing its row.
+   * Stable (reads state through refs) so memoized markers skip re-rendering. */
+  const focusRecord = useCallback((key: string) => {
+    const alreadySelected = selectedKeyRef.current === key;
+    setSelectedKey(alreadySelected ? null : key);
+    if (alreadySelected) return;
+    const index = displayRowsRef.current.findIndex((row) => row.key === key);
+    if (index < 0) return;
+    // Let the selection render (and any fold expansion settle) first.
+    setTimeout(() => listRef.current?.scrollToIndex({ index, animated: true, viewPosition: 0.5 }), 0);
+  }, []);
 
   // Turn labels collapse to `#N` on narrow ledgers.
   const narrow = compact || (ledgerWidth > 0 && ledgerWidth < NARROW_TURN_LABEL_WIDTH);
@@ -673,7 +692,7 @@ function TrajectoryLedger({
             leadTurn={item.leadTurn}
             narrow={narrow}
             styles={styles}
-            onPress={() => expandTurn(turn.id)}
+            onExpandTurn={expandTurn}
           />
         );
       }
@@ -682,12 +701,13 @@ function TrajectoryLedger({
         if (!fold) return null;
         return (
           <ToolFoldRow
+            foldKey={fold.key}
             count={fold.count}
             names={fold.names}
             leadTurn={item.leadTurn}
             narrow={narrow}
             styles={styles}
-            onPress={() => expandToolStep(fold.key)}
+            onExpandStep={expandToolStep}
           />
         );
       }
@@ -702,14 +722,12 @@ function TrajectoryLedger({
           narrow={narrow}
           selected={selectedKey === item.key}
           iconColor={itemColor(item.danger ? "danger" : (item.color ?? "muted"), theme)}
+          onRowPress={handleRowPress}
           styles={styles}
-          onPress={() => {
-            setSelectedKey((current) => (current === item.key ? null : item.key));
-          }}
         />
       );
     },
-    [selectedKey, styles, theme, expandToolStep, expandTurn, narrow],
+    [selectedKey, styles, theme, expandToolStep, expandTurn, narrow, handleRowPress],
   );
 
   return (
@@ -944,13 +962,10 @@ function TrajectoryLedger({
         ListHeaderComponent={header}
         onRefresh={trajectory.refresh}
         refreshing={trajectory.loading && rows.length > 0}
-        // The list opens at the tail; reaching the top loads the next older
-        // page. Prepended rows land at offset 0, so the newly loaded older
-        // rows are what the viewport shows — no scroll adjustment needed.
-        onStartReached={() => {
-          if (!followRef.current) trajectory.loadOlder();
-        }}
-        onStartReachedThreshold={0.4}
+        // The list opens at the tail; older pages load from the scroll
+        // event (see onScroll). Prepended rows land at offset 0, so the newly
+        // loaded older rows are what the viewport shows — no scroll
+        // adjustment needed.
         initialNumToRender={initialRenderRowsRef.current ?? 10}
         // Markers can target a row far outside the rendered window; fall back
         // to an estimated offset, then retry once it has been measured.
@@ -964,8 +979,26 @@ function TrajectoryLedger({
         onScroll={(event) => {
           const { contentOffset, layoutMeasurement, contentSize } = event.nativeEvent;
           const atTail = contentOffset.y + layoutMeasurement.height >= contentSize.height - 24;
-          followRef.current = atTail;
+          // Pinned until the initial tail snap is confirmed: native platforms
+          // run that scroll before content layout (it lands at the top), and
+          // the resulting scroll event must not unpin the onContentSizeChange
+          // chain that re-snaps once layout reports a real content size.
+          followRef.current = tailPositioned ? atTail : true;
           if (!tailPositioned && atTail) revealTail();
+          // Reaching the top zone pages older history in. `onStartReached` is a
+          // react-native-web-only prop, so the detector lives here — keeping
+          // native (mobile) paging working too. Keyed on content height so
+          // sitting at the top keeps loading as pages land (matching RNW's
+          // own onStartReached semantics).
+          const nearStart =
+            tailPositioned &&
+            contentSize.height > layoutMeasurement.height + 1 &&
+            contentOffset.y <= layoutMeasurement.height * LOAD_OLDER_TOP_FRACTION &&
+            startLoadHeightRef.current !== contentSize.height;
+          if (nearStart) {
+            startLoadHeightRef.current = contentSize.height;
+            trajectory.loadOlder();
+          }
         }}
         onLayout={(event) => {
           listHeightRef.current = event.nativeEvent.layout.height;
@@ -1395,19 +1428,20 @@ function TurnGutter({
 
 /** A folded turn's summary row: one line standing in for its hidden rows.
  * Tap re-expands the turn. The turn label, when this is the turn's first
- * shown row, rides in the gutter like any other row. */
-function FoldRow({
+ * shown row, rides in the gutter like any other row. Memoized: selection and
+ * poll updates re-render only the rows whose props actually changed. */
+const FoldRow = memo(function FoldRow({
   turn,
   leadTurn,
   narrow,
   styles,
-  onPress,
+  onExpandTurn,
 }: {
   turn: PreviewTurn;
   leadTurn?: PreviewTurn;
   narrow: boolean;
   styles: Styles;
-  onPress(): void;
+  onExpandTurn(turnId: string | null): void;
 }) {
   const [hovered, setHovered] = useState(false);
   const steps = `${turn.steps} ${turn.steps === 1 ? "step" : "steps"}`;
@@ -1416,7 +1450,7 @@ function FoldRow({
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={`Expand turn ${turn.index}: ${steps}, ${tools}`}
-      onPress={onPress}
+      onPress={() => onExpandTurn(turn.id)}
       onHoverIn={() => setHovered(true)}
       onHoverOut={() => setHovered(false)}
       style={[
@@ -1434,27 +1468,30 @@ function FoldRow({
       </View>
     </Pressable>
   );
-}
+});
 
 /** Distinct tool names listed before the summary truncates. */
 const TOOL_FOLD_NAME_LIMIT = 5;
 
 /** A folded step's tool calls: the chrome and hover highlight of a record
- * row. Tap expands the step. */
-function ToolFoldRow({
+ * row. Tap expands the step. Memoized: selection and poll updates re-render
+ * only the rows whose props actually changed. */
+const ToolFoldRow = memo(function ToolFoldRow({
+  foldKey,
   count,
   names,
   leadTurn,
   narrow,
   styles,
-  onPress,
+  onExpandStep,
 }: {
+  foldKey: string;
   count: number;
   names: string[];
   leadTurn?: PreviewTurn;
   narrow: boolean;
   styles: Styles;
-  onPress(): void;
+  onExpandStep(key: string): void;
 }) {
   const [hovered, setHovered] = useState(false);
   const calls = `${count} ${count === 1 ? "tool call" : "tool calls"}`;
@@ -1464,7 +1501,7 @@ function ToolFoldRow({
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={`Expand ${calls}: ${names.join(", ")}`}
-      onPress={onPress}
+      onPress={() => onExpandStep(foldKey)}
       onHoverIn={() => setHovered(true)}
       onHoverOut={() => setHovered(false)}
       style={[styles.entryRow, leadTurn?.id ? styles.turnStart : null, hovered ? styles.entryRowHovered : null]}
@@ -1478,25 +1515,26 @@ function ToolFoldRow({
       </View>
     </Pressable>
   );
-}
+});
 
-/** One pre-computed ledger row (kind "entry"). */
-function LedgerRowItem({
+/** One pre-computed ledger row (kind "entry"). Memoized: selection and poll
+ * updates re-render only the rows whose props actually changed. */
+const LedgerRowItem = memo(function LedgerRowItem({
   row,
   leadTurn,
   narrow,
   selected,
   iconColor,
+  onRowPress,
   styles,
-  onPress,
 }: {
   row: PreviewRow;
   leadTurn?: PreviewTurn;
   narrow: boolean;
   selected: boolean;
   iconColor: string;
+  onRowPress(key: string): void;
   styles: Styles;
-  onPress: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
   const preview = row.preview;
@@ -1515,7 +1553,7 @@ function LedgerRowItem({
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={`${row.label ?? "Record"}: ${row.summary ?? ""}`}
-      onPress={onPress}
+      onPress={() => onRowPress(row.key)}
       onHoverIn={() => setHovered(true)}
       onHoverOut={() => setHovered(false)}
       style={[
@@ -1555,5 +1593,5 @@ function LedgerRowItem({
       </View>
     </Pressable>
   );
-}
+});
 

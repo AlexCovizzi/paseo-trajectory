@@ -73,7 +73,13 @@ export function useTrajectory(agentId: string): TrajectoryState {
   const applyPage = useCallback(
     (page: TrajectoryPageResult) => {
       const map = rowsRef.current;
-      for (const row of page.rows) map.set(row.key, row);
+      for (const row of page.rows) {
+        // Keep the previous object when nothing rendered changed: rows keep
+        // their identity across polls, so memoized rows and markers skip
+        // re-rendering while only the tail actually changed.
+        const existing = map.get(row.key);
+        if (existing === undefined || !sameRow(existing, row)) map.set(row.key, row);
+      }
       if (page.rows.length > 0) {
         const pageFirst = Math.min(...page.rows.map((row) => row.order));
         firstOrderRef.current =
@@ -490,4 +496,52 @@ export function formatTimestamp(iso: string): string {
 
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+/** True when two page rows render identically, so a merge can keep the
+ * previous object identity. */
+function sameRow(a: PreviewRow, b: PreviewRow): boolean {
+  if (
+    a.kind !== b.kind ||
+    a.order !== b.order ||
+    a.icon !== b.icon ||
+    a.color !== b.color ||
+    a.label !== b.label ||
+    a.showLabel !== b.showLabel ||
+    a.summary !== b.summary ||
+    a.danger !== b.danger ||
+    a.dim !== b.dim ||
+    a.timestamp !== b.timestamp ||
+    a.turnIndex !== b.turnIndex ||
+    a.step !== b.step ||
+    a.provider !== b.provider
+  ) {
+    return false;
+  }
+  const aPreview = a.preview;
+  const bPreview = b.preview;
+  if ((aPreview === undefined) !== (bPreview === undefined)) return false;
+  if (
+    aPreview !== undefined &&
+    bPreview !== undefined &&
+    (aPreview.input !== bPreview.input ||
+      aPreview.output !== bPreview.output ||
+      aPreview.tone !== bPreview.tone)
+  ) {
+    return false;
+  }
+  const aTurn = a.turn;
+  const bTurn = b.turn;
+  if ((aTurn === undefined) !== (bTurn === undefined)) return false;
+  if (
+    aTurn !== undefined &&
+    bTurn !== undefined &&
+    (aTurn.id !== bTurn.id ||
+      aTurn.index !== bTurn.index ||
+      aTurn.steps !== bTurn.steps ||
+      aTurn.tools !== bTurn.tools)
+  ) {
+    return false;
+  }
+  return true;
 }

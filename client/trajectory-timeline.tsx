@@ -1,5 +1,5 @@
 import type { PluginTheme } from "@getpaseo/plugin";
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Pressable,
   ScrollView,
@@ -186,7 +186,13 @@ export function TrajectoryTimeline({
     }
     scrollRef.current?.scrollTo({ x: contentWidth - trackWidth, animated: false });
     if (revealTimerRef.current !== null) clearTimeout(revealTimerRef.current);
-    revealTimerRef.current = setTimeout(reveal, POSITION_REVEAL_FALLBACK_MS);
+    // Safety reveal for platforms where the initial scroll raced layout: one
+    // last snap attempt, then show (the follow chain is unpinned by the
+    // reveal, so this is the final nudge).
+    revealTimerRef.current = setTimeout(() => {
+      scrollRef.current?.scrollToEnd({ animated: false });
+      reveal();
+    }, POSITION_REVEAL_FALLBACK_MS);
   }, [trackMounted, contentWidth, trackWidth, reveal]);
 
   /** Flips the edge fades on only when a side actually becomes scrollable. */
@@ -206,10 +212,14 @@ export function TrajectoryTimeline({
     (event: NativeSyntheticEvent<NativeScrollEvent>) => {
       const { contentOffset, layoutMeasurement, contentSize } = event.nativeEvent;
       scrollXRef.current = contentOffset.x;
-      followRef.current =
-        contentOffset.x + layoutMeasurement.width >= contentSize.width - FOLLOW_THRESHOLD;
+      const atTail = contentOffset.x + layoutMeasurement.width >= contentSize.width - FOLLOW_THRESHOLD;
+      // Pinned until the initial tail snap is confirmed: native platforms run
+      // that scroll before content layout (it clamps to the left), and the
+      // resulting scroll event must not unpin the onContentSizeChange chain
+      // that re-snaps once layout reports a real content size.
+      followRef.current = positionedRef.current ? atTail : true;
       updateEdges(contentOffset.x, layoutMeasurement.width, contentSize.width);
-      if (!positionedRef.current && followRef.current) reveal();
+      if (!positionedRef.current && atTail) reveal();
       const nearStart = contentSize.width > layoutMeasurement.width + 1 && contentOffset.x <= LOAD_OLDER_THRESHOLD;
       if (nearStart && !atStartRef.current) onReachStart?.();
       atStartRef.current = nearStart;
@@ -219,6 +229,15 @@ export function TrajectoryTimeline({
 
   const handleContentSizeChange = useCallback(() => {
     if (followRef.current) scrollRef.current?.scrollToEnd({ animated: false });
+  }, []);
+
+  // Stable hover plumbing: the memoized markers below re-render only when
+  // their own hover/selection state moves, not on every pointer move.
+  const handleMarkerHover = useCallback((row: PreviewRow, x: number, y: number) => {
+    setHovered({ row, x, y });
+  }, []);
+  const handleMarkerHoverEnd = useCallback((key: string) => {
+    setHovered((current) => (current?.row.key === key ? null : current));
   }, []);
 
   // Older rows prepend on the left; shift the offset by the width of the added
@@ -272,63 +291,25 @@ export function TrajectoryTimeline({
             <View style={{ width: contentWidth, height: bandHeight }}>
               {events.map((event) => {
                 const laneIndex = LANE_INDEX[event.lane];
-                const top =
-                  BAND_PAD + laneIndex * ROW_HEIGHT + (ROW_HEIGHT - MARKER_HEIGHT) / 2;
+                const top = BAND_PAD + laneIndex * ROW_HEIGHT + (ROW_HEIGHT - MARKER_HEIGHT) / 2;
                 const left = TRACK_PAD + event.slot * pitch + (pitch - markerWidth) / 2;
-                const base = markerColor(event.row, theme);
-                const selected = selectedKey === event.row.key;
-                const isHovered = hovered?.row.key === event.row.key;
-                const dimmed = dimNonMatches && !matchKeys.has(event.row.key);
                 return (
-                  <Fragment key={event.row.key}>
-                    <Pressable
-                      accessibilityRole="button"
-                      accessibilityLabel={`${event.row.label ?? "Record"}: ${event.row.summary ?? ""}`}
-                      onPress={() => onSelectRow(event.row.key)}
-                      onHoverIn={(mouseEvent) => {
-                        const { offsetX, offsetY } = mouseEvent.nativeEvent;
-                        setHovered({
-                          row: event.row,
-                          x: left + (Number.isFinite(offsetX) ? offsetX : markerWidth / 2),
-                          y: top + (Number.isFinite(offsetY) ? offsetY : 0),
-                        });
-                      }}
-                      onHoverOut={() =>
-                        setHovered((current) => (current?.row.key === event.row.key ? null : current))
-                      }
-                      style={[
-                        styles.marker,
-                        {
-                          left,
-                          top,
-                          width: markerWidth,
-                          height: MARKER_HEIGHT,
-                          backgroundColor: isHovered
-                            ? mixColor(base, theme.colors.foreground, 0.25)
-                            : base,
-                          opacity: dimmed ? 0.1 : 1,
-                        },
-                      ]}
-                    />
-                    {selected || isHovered ? (
-                      <View
-                        pointerEvents="none"
-                        style={[
-                          styles.markerRing,
-                          {
-                            left: left - RING_WIDTH,
-                            top: top - RING_WIDTH,
-                            width: markerWidth + RING_WIDTH * 2,
-                            height: MARKER_HEIGHT + RING_WIDTH * 2,
-                            borderWidth: RING_WIDTH,
-                            borderColor: selected
-                              ? theme.colors.accent
-                              : mixColor(theme.colors.accent, theme.colors.surface1, 0.5),
-                          },
-                        ]}
-                      />
-                    ) : null}
-                  </Fragment>
+                  <TimelineMarker
+                    key={event.row.key}
+                    row={event.row}
+                    left={left}
+                    top={top}
+                    width={markerWidth}
+                    height={MARKER_HEIGHT}
+                    selected={selectedKey === event.row.key}
+                    hovered={hovered?.row.key === event.row.key}
+                    dimmed={dimNonMatches && !matchKeys.has(event.row.key)}
+                    theme={theme}
+                    styles={styles}
+                    onSelectRow={onSelectRow}
+                    onHover={handleMarkerHover}
+                    onHoverEnd={handleMarkerHoverEnd}
+                  />
                 );
               })}
             </View>
@@ -360,6 +341,88 @@ export function TrajectoryTimeline({
     </View>
   );
 }
+
+/** One event marker: the fill plus its selection/hover ring. Memoized on the
+ * row's identity and slot geometry, so polls and selection changes re-render
+ * only the affected markers. */
+const TimelineMarker = memo(function TimelineMarker({
+  row,
+  left,
+  top,
+  width,
+  height,
+  selected,
+  hovered,
+  dimmed,
+  theme,
+  styles,
+  onSelectRow,
+  onHover,
+  onHoverEnd,
+}: {
+  row: PreviewRow;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  selected: boolean;
+  hovered: boolean;
+  dimmed: boolean;
+  theme: PluginTheme;
+  styles: ReturnType<typeof createStyles>;
+  onSelectRow(key: string): void;
+  onHover(row: PreviewRow, x: number, y: number): void;
+  onHoverEnd(key: string): void;
+}) {
+  const base = markerColor(row, theme);
+  return (
+    <>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${row.label ?? "Record"}: ${row.summary ?? ""}`}
+        onPress={() => onSelectRow(row.key)}
+        onHoverIn={(mouseEvent) => {
+          const { offsetX, offsetY } = mouseEvent.nativeEvent;
+          onHover(
+            row,
+            left + (Number.isFinite(offsetX) ? offsetX : width / 2),
+            top + (Number.isFinite(offsetY) ? offsetY : 0),
+          );
+        }}
+        onHoverOut={() => onHoverEnd(row.key)}
+        style={[
+          styles.marker,
+          {
+            left,
+            top,
+            width,
+            height,
+            backgroundColor: hovered ? mixColor(base, theme.colors.foreground, 0.25) : base,
+            opacity: dimmed ? 0.1 : 1,
+          },
+        ]}
+      />
+      {selected || hovered ? (
+        <View
+          pointerEvents="none"
+          style={[
+            styles.markerRing,
+            {
+              left: left - RING_WIDTH,
+              top: top - RING_WIDTH,
+              width: width + RING_WIDTH * 2,
+              height: height + RING_WIDTH * 2,
+              borderWidth: RING_WIDTH,
+              borderColor: selected
+                ? theme.colors.accent
+                : mixColor(theme.colors.accent, theme.colors.surface1, 0.5),
+            },
+          ]}
+        />
+      ) : null}
+    </>
+  );
+});
 
 /** Layered strips fake a gradient fade toward the band surface at a scrollable edge. */
 function EdgeFade({ side, color, height }: { side: "left" | "right"; color: string; height: number }) {
