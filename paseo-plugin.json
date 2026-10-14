@@ -1,0 +1,9 @@
+{
+  "id": "paseo-trajectory",
+  "name": "Trajectory",
+  "description": "Inspect an agent as a turn-aware trajectory ledger with a record inspector.",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.11.2"
+  }
+}

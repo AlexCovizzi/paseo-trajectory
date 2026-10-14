@@ -1,0 +1,32 @@
+{
+  "name": "paseo-trajectory",
+  "private": true,
+  "version": "0.0.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AlexCovizzi/paseo-trajectory.git"
+  },
+  "files": [
+    "paseo-plugin.json",
+    "README.md",
+    "index.client.tsx",
+    "index.server.ts",
+    "client/",
+    "server/",
+    "shared/"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "@getpaseo/plugin": "0.11.2",
+    "@types/node": "^26.6.5",
+    "@types/react": "~19.2.0",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "zod": "^4.4.3"
+  }
+}
