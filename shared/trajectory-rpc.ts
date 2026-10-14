@@ -92,17 +92,21 @@ export const getTrajectoryPageRpc = defineRpc({
   output: trajectoryPageOutputSchema,
 });
 
-/**
- * Serves one full timeline entry for the record inspector. The entry is the
- * daemon's own timeline entry passed through unvalidated: re-declaring the
- * whole AgentTimelineItem union in a wire schema would be brittle, and both
- * sides ship the same plugin version. The client casts to its derived
- * TimelineEntry type.
- */
+/** One daemon timeline entry. `item` is a passthrough; the client narrows it
+ * via the mirror in shared/timeline-types.ts. */
+const timelineEntryEnvelopeSchema = z.object({
+  provider: z.string(),
+  item: z.unknown(),
+  turnId: z.string().optional(),
+  timestamp: z.string(),
+  seqStart: z.number(),
+});
+
+/** Serves one full timeline entry for the record inspector. */
 export const getRecordDetailRpc = defineRpc({
   name: "get-record-detail",
   input: z.object({ agentId: z.string().min(1), key: z.string().min(1) }),
-  output: z.object({ entry: z.unknown().nullable() }),
+  output: z.object({ entry: timelineEntryEnvelopeSchema.nullable() }),
 });
 
 const searchMatchSchema = z.object({

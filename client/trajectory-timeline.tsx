@@ -17,7 +17,7 @@ import type { PreviewRow } from "../shared/trajectory-rpc";
  * Compact trajectory overview that sits above the ledger: one unlabeled track
  * row per event category, with one small rounded square per event placed in
  * chronological order. Marker color matches the row's icon color, so the row
- * a marker sits in (and its color) identifies the category. See OVERVIEW.md.
+ * a marker sits in (and its color) identifies the category.
  *
  * The lane labels collapse away on narrow panes; the track always fills the
  * available width and scrolls horizontally once the events outgrow it.

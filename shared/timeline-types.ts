@@ -1,14 +1,7 @@
 /**
- * Structural mirror of the daemon's timeline types (@getpaseo/protocol
- * 0.11.2, pinned by @getpaseo/plugin 0.11.2).
- *
- * The plugin host forbids importing the client- or server-only entry modules
- * from shared bundle code, and the plugin never imports @getpaseo/client or
- * @getpaseo/protocol directly (the host injects those for the documented entry
- * points), so the shapes the shared preview logic touches are declared here.
- * They cover exactly what shared/ and its consumers use; the server store's
- * real entries are assignable to them, which keeps the mirror honest at
- * typecheck time. If the SDK is upgraded, update this mirror.
+ * Structural mirror of the daemon's timeline types. The host forbids importing
+ * the SDK types into shared bundle code, so the shapes shared/ uses live here;
+ * test/timeline-conformance.ts keeps them in step with the SDK.
  */
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
