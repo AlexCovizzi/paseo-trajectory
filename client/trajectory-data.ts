@@ -271,7 +271,8 @@ export function useRecordDetail(
   const callDetail = useRpc(getRecordDetailRpc);
   const [entry, setEntry] = useState<TimelineEntry | null>(null);
   const [loading, setLoading] = useState(false);
-  const cacheRef = useRef(new Map<string, TimelineEntry | null>());
+  // Positive entries only; a null (evicted) result is refetched.
+  const cacheRef = useRef(new Map<string, TimelineEntry>());
 
   useEffect(() => {
     if (!key) {
@@ -281,6 +282,9 @@ export function useRecordDetail(
     }
     const cached = cacheRef.current.get(key);
     if (cached !== undefined) {
+      // Re-insert to refresh recency.
+      cacheRef.current.delete(key);
+      cacheRef.current.set(key, cached);
       setEntry(cached);
       setLoading(false);
       return;
@@ -291,10 +295,14 @@ export function useRecordDetail(
       .then((result) => {
         if (cancelled) return;
         const value = (result.entry ?? null) as TimelineEntry | null;
-        cacheRef.current.set(key, value);
-        if (cacheRef.current.size > DETAIL_CACHE_LIMIT) {
-          const oldest = cacheRef.current.keys().next().value;
-          if (oldest !== undefined) cacheRef.current.delete(oldest);
+        if (value !== null) {
+          const cache = cacheRef.current;
+          cache.delete(key);
+          cache.set(key, value);
+          if (cache.size > DETAIL_CACHE_LIMIT) {
+            const oldest = cache.keys().next().value;
+            if (oldest !== undefined) cache.delete(oldest);
+          }
         }
         setEntry(value);
         setLoading(false);
@@ -439,7 +447,7 @@ export function useWorkspaces(): WorkspacesState {
         );
         setError(null);
       } catch (cause) {
-        if (disposedRef.current) setError(messageOf(cause));
+        if (!disposedRef.current) setError(messageOf(cause));
       }
     };
     void load().finally(() => {
