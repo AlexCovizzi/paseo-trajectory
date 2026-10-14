@@ -186,16 +186,23 @@ describe("TrajectoryStore", () => {
         hasNewer: !last,
       });
     }
-    const { store } = await makeStore(pages);
+    const { store, pages: livePages } = await makeStore(pages);
 
-    const turns = (store as unknown as { turns: Array<{ frozen: boolean }> }).turns;
-    assert.equal(turns.some((turn) => turn.frozen), true);
-    assert.equal(turns[0].frozen, true);
+    const state = store as unknown as { turns: Array<{ frozen: boolean }>; frozenTurns: number };
+    assert.equal(state.turns.some((turn) => turn.frozen), true);
+    assert.equal(state.turns[0].frozen, true);
 
     // Record content of an evicted entry is gone, but its ledger row remains.
     const key = entryKey(entries[0]);
     assert.equal(store.detail(key), null);
     assert.ok(store.page(20_000).rows.some((row) => row.kind === "entry" && row.key === key));
+
+    // A live reconcile keeps the frozen prefix (and its count) intact and can
+    // still evict.
+    livePages.push({ entries: turn("live"), endCursor: null, hasNewer: false });
+    await (store as unknown as { refetchTail(): Promise<void> }).refetchTail();
+    assert.equal(state.frozenTurns, state.turns.filter((turn) => turn.frozen).length);
+    assert.equal(state.turns.slice(0, state.frozenTurns).every((turn) => turn.frozen), true);
   });
 
   it("reseeds from scratch when the timeline is replaced", async () => {

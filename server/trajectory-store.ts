@@ -98,6 +98,8 @@ export class TrajectoryStore {
   private entries = new Map<string, TimelineEntry>();
   private previews = new Map<string, EntryPreview>();
   private turns: TurnState[] = [];
+  /** Frozen turns are a prefix of `turns`; this is where the live ones start. */
+  private frozenTurns = 0;
   private turnIndexByKey = new Map<string, number>();
   private nextTurnIndex = 1;
   /** Flat row list: frozen prefix + live rows. A row's `order` is its index. */
@@ -252,6 +254,7 @@ export class TrajectoryStore {
         this.searchBlobs.clear();
         this.searchCache.clear();
         this.turns = [];
+        this.frozenTurns = 0;
         this.rows = [];
         this.turnIndexByKey.clear();
         this.nextTurnIndex = 1;
@@ -298,6 +301,7 @@ export class TrajectoryStore {
     this.searchBlobs.clear();
     this.searchCache.clear();
     this.turns = [];
+    this.frozenTurns = 0;
     this.turnIndexByKey.clear();
     this.nextTurnIndex = 1;
     this.rows = [];
@@ -406,9 +410,8 @@ export class TrajectoryStore {
    * detail for them reads as unavailable. */
   private evictIfNeeded(): void {
     while (this.entries.size > MAX_ENTRIES_PER_AGENT) {
-      const live = this.turns.filter((turn) => !turn.frozen);
-      const first = live[0];
-      if (!first || live.length <= 1) break;
+      const first = this.turns[this.frozenTurns];
+      if (!first || this.turns.length - this.frozenTurns <= 1) break;
       for (const entry of first.entries) {
         const key = entryKey(entry);
         this.entries.delete(key);
@@ -417,6 +420,7 @@ export class TrajectoryStore {
       }
       first.entries = [];
       first.frozen = true;
+      this.frozenTurns += 1;
     }
   }
 
