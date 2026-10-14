@@ -174,10 +174,9 @@ export function TrajectoryTimeline({
   const contentWidth = TRACK_PAD * 2 + eventCount * pitch;
   const trackMounted = width > 0 && eventCount > 0;
 
-  // Park the track on the newest event before the first paint. The content
+  // Park the track on the newest event before the first paint: the content
   // width is exact (markers are absolutely placed), so the tail offset is
-  // known without waiting for layout; platforms that apply the scroll
-  // asynchronously are covered by the reveal timer.
+  // known without waiting for layout.
   useLayoutEffect(() => {
     if (!trackMounted || positionedRef.current) return;
     if (contentWidth <= trackWidth) {
@@ -186,9 +185,8 @@ export function TrajectoryTimeline({
     }
     scrollRef.current?.scrollTo({ x: contentWidth - trackWidth, animated: false });
     if (revealTimerRef.current !== null) clearTimeout(revealTimerRef.current);
-    // Safety reveal for platforms where the initial scroll raced layout: one
-    // last snap attempt, then show (the follow chain is unpinned by the
-    // reveal, so this is the final nudge).
+    // Reveal regardless after one last snap attempt: a track that fits
+    // never scrolls (no event fires).
     revealTimerRef.current = setTimeout(() => {
       scrollRef.current?.scrollToEnd({ animated: false });
       reveal();
@@ -213,10 +211,7 @@ export function TrajectoryTimeline({
       const { contentOffset, layoutMeasurement, contentSize } = event.nativeEvent;
       scrollXRef.current = contentOffset.x;
       const atTail = contentOffset.x + layoutMeasurement.width >= contentSize.width - FOLLOW_THRESHOLD;
-      // Pinned until the initial tail snap is confirmed: native platforms run
-      // that scroll before content layout (it clamps to the left), and the
-      // resulting scroll event must not unpin the onContentSizeChange chain
-      // that re-snaps once layout reports a real content size.
+      // Pinned until the initial tail snap is confirmed (see reveal).
       followRef.current = positionedRef.current ? atTail : true;
       updateEdges(contentOffset.x, layoutMeasurement.width, contentSize.width);
       if (!positionedRef.current && atTail) reveal();

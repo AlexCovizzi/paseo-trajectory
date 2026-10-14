@@ -6,7 +6,16 @@ import {
   ScrollView,
   TextInput as ModalTextInput,
 } from "@getpaseo/plugin/client/react-native";
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   ActivityIndicator,
   PanResponder,
@@ -55,13 +64,34 @@ const MAX_INSPECTOR_HEIGHT = 720;
 const SIDE_PLACEMENT_MIN_WIDTH = 560;
 /** Ledger width below which turn margin labels collapse to `#N`. */
 const NARROW_TURN_LABEL_WIDTH = 380;
-/** Cap on rows mounted with the first tail page: the page mounts in one commit,
- * so the ledger's content height is final before the tail scroll runs. */
-const INITIAL_RENDER_ROWS = 1000;
+/** Rows mounted with the initial tail page. VirtualizedList retains the
+ * initial region on every update (its scroll-to-top optimization), so this is
+ * a constant rather than the live row count — a live value would keep widening
+ * the retained region as older pages load and defeat virtualization. */
+const INITIAL_RENDER_ROWS = 400;
 /** Safety reveal for the hidden-until-tail-positioned ledger. */
 const TAIL_REVEAL_FALLBACK_MS = 400;
 /** Viewport-top fraction that pages older history in (scroll-event detector). */
 const LOAD_OLDER_TOP_FRACTION = 0.4;
+
+/**
+ * Exact ledger row height: rows are single-line with fixed chrome — entry and
+ * fold rows are 30px (12px padding + 18px line) plus 1px when they lead a turn
+ * (the top rule), step rules are 0.5px, and turn rows render nothing. Feeds
+ * getItemLayout and the deterministic prepend compensation below.
+ */
+function rowHeight(row: LedgerRow): number {
+  switch (row.kind) {
+    case "step":
+      return 0.5;
+    case "entry":
+    case "fold":
+    case "toolfold":
+      return 30 + (row.leadTurn?.id ? 1 : 0);
+    default:
+      return 0;
+  }
+}
 
 type InspectorPlacement = "side" | "bottom";
 
@@ -209,7 +239,7 @@ function createStyles(theme: PluginTheme, compact: boolean) {
     bodyResizing: { userSelect: "none" } as unknown as ViewStyle,
     ledger: { flex: 1, minHeight: 0, minWidth: 0 } satisfies ViewStyle,
     list: { flex: 1 } satisfies ViewStyle,
-    // Ledger pre-positioning: never paint mid-page before the tail scroll.
+    // Ledger pre-positioning: never paint mid-page before the tail snap.
     hidden: { opacity: 0 } satisfies ViewStyle,
     listContent: { paddingVertical: 4 } satisfies ViewStyle,
     footer: { paddingVertical: 12, alignItems: "center" } satisfies ViewStyle,
@@ -495,23 +525,21 @@ function TrajectoryLedger({
     bodyWidth > 0 && bodyWidth < SIDE_PLACEMENT_MIN_WIDTH ? "bottom" : "side";
   const placement: InspectorPlacement = placementOverride ?? autoPlacement;
   const listRef = useRef<NativeFlatList<LedgerRow>>(null);
-  // Starts pinned to the tail (the initial page is the session tail); flips
-  // false once the user scrolls away so live rows stop interrupting, and
-  // scroll-up near the top loads the next older page.
+  // Content height the last older-page load fired at (see onScroll): it keys
+  // the load detector so sitting at the top of the loaded history keeps loading
+  // as pages land, without firing twice for one content height.
+  const startLoadHeightRef = useRef<number | null>(null);
+  // True while the viewport sits at the tail; live rows then scroll into
+  // view. Stays pinned until the initial tail snap is confirmed (see
+  // revealTail), so the snap can retry until it lands.
   const followRef = useRef(true);
   const didInitialScrollRef = useRef(false);
-  // Opening must land on the newest records without a visible jump: the list
-  // mounts hidden and is revealed only once it is verified parked at the end
-  // (a scroll event at the tail, a page that fits the viewport, or the safety
-  // timer below).
+  // The list mounts hidden and is revealed once it is verified parked on
+  // the newest rows (see revealTail).
   const [tailPositioned, setTailPositioned] = useState(false);
-  const initialRenderRowsRef = useRef<number | null>(null);
   const listHeightRef = useRef(0);
   const contentHeightRef = useRef(0);
   const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Content height the last older-page load fired at (see onScroll): native
-  // RN has no `onStartReached`, so paging is driven from the scroll event.
-  const startLoadHeightRef = useRef<number | null>(null);
   const revealTail = useCallback(() => {
     if (revealTimerRef.current !== null) {
       clearTimeout(revealTimerRef.current);
@@ -525,6 +553,12 @@ function TrajectoryLedger({
     },
     [],
   );
+  // Scroll plumbing for the prepend compensation (see the layout effect
+  // below): latest offset, the target a pending compensation pins to, and
+  // the first display row key before the current data.
+  const offsetYRef = useRef(0);
+  const pendingTargetRef = useRef<number | null>(null);
+  const firstKeyRef = useRef<string | null>(null);
   const widthRef = useRef(inspectorWidth);
   const heightRef = useRef(inspectorHeight);
   const bodyWidthRef = useRef(bodyWidth);
@@ -588,14 +622,11 @@ function TrajectoryLedger({
 
   const styles = useMemo(() => createStyles(theme, compact), [theme, compact]);
 
-  // The initial page is the session tail: park the ledger on the newest rows
-  // before the first paint. A layout effect (not a plain effect) so the scroll
-  // lands in the same frame the rows mount; the still-hidden list is revealed
-  // only once it is actually sitting at the end.
+  // The initial page is the session tail: park the ledger on the newest
+  // rows before the first paint.
   useLayoutEffect(() => {
     if (trajectory.loading) {
       didInitialScrollRef.current = false;
-      initialRenderRowsRef.current = null;
       return;
     }
     if (!didInitialScrollRef.current && rows.length > 0) {
@@ -603,10 +634,8 @@ function TrajectoryLedger({
       setTailPositioned(false);
       followRef.current = true;
       listRef.current?.scrollToEnd({ animated: false });
-      // A page that fits the viewport never scrolls (no event fires), and a
-      // lost scroll event must not leave the ledger hidden: reveal — after
-      // one last snap attempt, for platforms where the initial scroll raced
-      // layout (the follow chain is unpinned by the reveal).
+      // A page that fits the viewport never scrolls (no event fires); reveal
+      // regardless, after one last snap attempt.
       if (revealTimerRef.current !== null) clearTimeout(revealTimerRef.current);
       revealTimerRef.current = setTimeout(() => {
         listRef.current?.scrollToEnd({ animated: false });
@@ -649,17 +678,47 @@ function TrajectoryLedger({
   );
   const displayRowsRef = useRef(displayRows);
   displayRowsRef.current = displayRows;
+  // Exact row geometry: ledger rows have known heights (see rowHeight), so a
+  // prefix sum yields every row's height and offset without mounting anything.
+  // VirtualizedList gets exact frame metrics via getItemLayout, and the
+  // prepend compensation below computes its scroll target from it.
+  const offsets = useMemo(() => {
+    const sums = new Array<number>(displayRows.length + 1);
+    sums[0] = 0;
+    for (let index = 0; index < displayRows.length; index += 1) {
+      sums[index + 1] = sums[index] + rowHeight(displayRows[index]);
+    }
+    return sums;
+  }, [displayRows]);
+  const getItemLayout = useCallback(
+    (_data: ArrayLike<LedgerRow> | null | undefined, index: number) => ({
+      length: offsets[index + 1] - offsets[index],
+      offset: offsets[index],
+      index,
+    }),
+    [offsets],
+  );
+  // Older pages prepend above the rows the user is reading; re-pin the
+  // scroll so those rows stay in place. The target is exact (see rowHeight),
+  // so retries — while the prepended cells mount — are idempotent; a scroll
+  // event at the target ends them (see onScroll).
+  useLayoutEffect(() => {
+    const previousFirst = firstKeyRef.current;
+    firstKeyRef.current = displayRows[0]?.key ?? null;
+    if (previousFirst === null || !tailPositioned) return;
+    if (displayRows[0]?.key === previousFirst) return;
+    const anchorIndex = displayRows.findIndex((row) => row.key === previousFirst);
+    if (anchorIndex <= 0) return;
+    const target = offsetYRef.current + offsets[anchorIndex];
+    pendingTargetRef.current = target;
+    offsetYRef.current = target;
+    listRef.current?.scrollToOffset({ offset: target, animated: false });
+  }, [displayRows, offsets, tailPositioned]);
   // Rows re-render when the selection changes.
   const listExtraData = useMemo(
     () => ({ selectedKey, collapsedToolSteps, collapsedTurns }),
     [selectedKey, collapsedToolSteps, collapsedTurns],
   );
-  // Frozen at the first data render: VirtualizedList re-derives the retained
-  // initial region from the prop on every update, so a live value would keep
-  // widening it as older pages load and defeat virtualization.
-  if (initialRenderRowsRef.current === null && displayRows.length > 0) {
-    initialRenderRowsRef.current = Math.min(displayRows.length, INITIAL_RENDER_ROWS);
-  }
 
   /** Row tap: toggles selection. Stable so memoized rows skip re-rendering. */
   const handleRowPress = useCallback((key: string) => {
@@ -962,11 +1021,8 @@ function TrajectoryLedger({
         ListHeaderComponent={header}
         onRefresh={trajectory.refresh}
         refreshing={trajectory.loading && rows.length > 0}
-        // The list opens at the tail; older pages load from the scroll
-        // event (see onScroll). Prepended rows land at offset 0, so the newly
-        // loaded older rows are what the viewport shows — no scroll
-        // adjustment needed.
-        initialNumToRender={initialRenderRowsRef.current ?? 10}
+        initialNumToRender={INITIAL_RENDER_ROWS}
+        getItemLayout={getItemLayout}
         // Markers can target a row far outside the rendered window; fall back
         // to an estimated offset, then retry once it has been measured.
         onScrollToIndexFailed={(info) => {
@@ -978,18 +1034,20 @@ function TrajectoryLedger({
         scrollEventThrottle={16}
         onScroll={(event) => {
           const { contentOffset, layoutMeasurement, contentSize } = event.nativeEvent;
+          offsetYRef.current = contentOffset.y;
+          // A pending prepend compensation pins one exact target; once a scroll
+          // event lands on it, the re-pinning is done.
+          const pending = pendingTargetRef.current;
+          if (pending !== null && Math.abs(contentOffset.y - pending) < 1) {
+            pendingTargetRef.current = null;
+          }
           const atTail = contentOffset.y + layoutMeasurement.height >= contentSize.height - 24;
-          // Pinned until the initial tail snap is confirmed: native platforms
-          // run that scroll before content layout (it lands at the top), and
-          // the resulting scroll event must not unpin the onContentSizeChange
-          // chain that re-snaps once layout reports a real content size.
+          // Pinned until the initial tail snap is confirmed (see revealTail).
           followRef.current = tailPositioned ? atTail : true;
           if (!tailPositioned && atTail) revealTail();
-          // Reaching the top zone pages older history in. `onStartReached` is a
-          // react-native-web-only prop, so the detector lives here — keeping
-          // native (mobile) paging working too. Keyed on content height so
-          // sitting at the top keeps loading as pages land (matching RNW's
-          // own onStartReached semantics).
+          // Reaching the top zone pages older history in. Keyed on content
+          // height so sitting at the top keeps loading as pages land, without
+          // firing twice for one content height.
           const nearStart =
             tailPositioned &&
             contentSize.height > layoutMeasurement.height + 1 &&
@@ -999,6 +1057,10 @@ function TrajectoryLedger({
             startLoadHeightRef.current = contentSize.height;
             trajectory.loadOlder();
           }
+        }}
+        // A user drag wins over a pending compensation pin.
+        onScrollBeginDrag={() => {
+          pendingTargetRef.current = null;
         }}
         onLayout={(event) => {
           listHeightRef.current = event.nativeEvent.layout.height;
@@ -1012,6 +1074,11 @@ function TrajectoryLedger({
         }}
         onContentSizeChange={(_width, height) => {
           contentHeightRef.current = height;
+          // Re-pin a pending prepend compensation while the prepended cells
+          // mount in batches; the target is exact, so this is idempotent.
+          if (pendingTargetRef.current !== null) {
+            listRef.current?.scrollToOffset({ offset: pendingTargetRef.current, animated: false });
+          }
           if (followRef.current) listRef.current?.scrollToEnd({ animated: false });
           // The whole page fits the viewport: there is no tail to scroll to,
           // so reveal at once.
