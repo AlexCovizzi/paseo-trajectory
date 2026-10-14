@@ -6,7 +6,7 @@ import {
   ScrollView,
   TextInput as ModalTextInput,
 } from "@getpaseo/plugin/client/react-native";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ActivityIndicator,
   PanResponder,
@@ -55,6 +55,11 @@ const MAX_INSPECTOR_HEIGHT = 720;
 const SIDE_PLACEMENT_MIN_WIDTH = 560;
 /** Ledger width below which turn margin labels collapse to `#N`. */
 const NARROW_TURN_LABEL_WIDTH = 380;
+/** Cap on rows mounted with the first tail page: the page mounts in one commit,
+ * so the ledger's content height is final before the tail scroll runs. */
+const INITIAL_RENDER_ROWS = 1000;
+/** Safety reveal for the hidden-until-tail-positioned ledger. */
+const TAIL_REVEAL_FALLBACK_MS = 400;
 
 type InspectorPlacement = "side" | "bottom";
 
@@ -202,6 +207,8 @@ function createStyles(theme: PluginTheme, compact: boolean) {
     bodyResizing: { userSelect: "none" } as unknown as ViewStyle,
     ledger: { flex: 1, minHeight: 0, minWidth: 0 } satisfies ViewStyle,
     list: { flex: 1 } satisfies ViewStyle,
+    // Ledger pre-positioning: never paint mid-page before the tail scroll.
+    hidden: { opacity: 0 } satisfies ViewStyle,
     listContent: { paddingVertical: 4 } satisfies ViewStyle,
     footer: { paddingVertical: 12, alignItems: "center" } satisfies ViewStyle,
     inspector: {
@@ -487,6 +494,28 @@ function TrajectoryLedger({
   // scroll-up near the top loads the next older page.
   const followRef = useRef(true);
   const didInitialScrollRef = useRef(false);
+  // Opening must land on the newest records without a visible jump: the list
+  // mounts hidden and is revealed only once it is verified parked at the end
+  // (a scroll event at the tail, a page that fits the viewport, or the safety
+  // timer below).
+  const [tailPositioned, setTailPositioned] = useState(false);
+  const initialRenderRowsRef = useRef<number | null>(null);
+  const listHeightRef = useRef(0);
+  const contentHeightRef = useRef(0);
+  const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const revealTail = useCallback(() => {
+    if (revealTimerRef.current !== null) {
+      clearTimeout(revealTimerRef.current);
+      revealTimerRef.current = null;
+    }
+    setTailPositioned(true);
+  }, []);
+  useEffect(
+    () => () => {
+      if (revealTimerRef.current !== null) clearTimeout(revealTimerRef.current);
+    },
+    [],
+  );
   const widthRef = useRef(inspectorWidth);
   const heightRef = useRef(inspectorHeight);
   const bodyWidthRef = useRef(bodyWidth);
@@ -550,17 +579,27 @@ function TrajectoryLedger({
 
   const styles = useMemo(() => createStyles(theme, compact), [theme, compact]);
 
-  // The initial page is the session tail: jump to the newest row once it lands.
-  useEffect(() => {
+  // The initial page is the session tail: park the ledger on the newest rows
+  // before the first paint. A layout effect (not a plain effect) so the scroll
+  // lands in the same frame the rows mount; the still-hidden list is revealed
+  // only once it is actually sitting at the end.
+  useLayoutEffect(() => {
     if (trajectory.loading) {
       didInitialScrollRef.current = false;
+      initialRenderRowsRef.current = null;
       return;
     }
     if (!didInitialScrollRef.current && rows.length > 0) {
       didInitialScrollRef.current = true;
+      setTailPositioned(false);
+      followRef.current = true;
       listRef.current?.scrollToEnd({ animated: false });
+      // A page that fits the viewport never scrolls (no event fires), and a
+      // lost scroll event must not leave the ledger hidden: reveal regardless.
+      if (revealTimerRef.current !== null) clearTimeout(revealTimerRef.current);
+      revealTimerRef.current = setTimeout(revealTail, TAIL_REVEAL_FALLBACK_MS);
     }
-  }, [trajectory.loading, rows.length]);
+  }, [trajectory.loading, rows.length, revealTail]);
 
   // --- Search ---------------------------------------------------------------
 
@@ -599,6 +638,12 @@ function TrajectoryLedger({
     () => ({ selectedKey, collapsedToolSteps, collapsedTurns }),
     [selectedKey, collapsedToolSteps, collapsedTurns],
   );
+  // Frozen at the first data render: VirtualizedList re-derives the retained
+  // initial region from the prop on every update, so a live value would keep
+  // widening it as older pages load and defeat virtualization.
+  if (initialRenderRowsRef.current === null && displayRows.length > 0) {
+    initialRenderRowsRef.current = Math.min(displayRows.length, INITIAL_RENDER_ROWS);
+  }
 
   /** Selects a timeline marker, opening the inspector and revealing its row. */
   const focusRecord = useCallback(
@@ -894,7 +939,7 @@ function TrajectoryLedger({
         keyExtractor={(row) => row.key}
         renderItem={renderRow}
         extraData={listExtraData}
-        style={styles.list}
+        style={[styles.list, tailPositioned ? null : styles.hidden]}
         contentContainerStyle={styles.listContent}
         ListHeaderComponent={header}
         onRefresh={trajectory.refresh}
@@ -906,7 +951,7 @@ function TrajectoryLedger({
           if (!followRef.current) trajectory.loadOlder();
         }}
         onStartReachedThreshold={0.4}
-        initialNumToRender={20}
+        initialNumToRender={initialRenderRowsRef.current ?? 10}
         // Markers can target a row far outside the rendered window; fall back
         // to an estimated offset, then retry once it has been measured.
         onScrollToIndexFailed={(info) => {
@@ -918,10 +963,28 @@ function TrajectoryLedger({
         scrollEventThrottle={16}
         onScroll={(event) => {
           const { contentOffset, layoutMeasurement, contentSize } = event.nativeEvent;
-          followRef.current = contentOffset.y + layoutMeasurement.height >= contentSize.height - 24;
+          const atTail = contentOffset.y + layoutMeasurement.height >= contentSize.height - 24;
+          followRef.current = atTail;
+          if (!tailPositioned && atTail) revealTail();
         }}
-        onContentSizeChange={() => {
+        onLayout={(event) => {
+          listHeightRef.current = event.nativeEvent.layout.height;
+          if (
+            !tailPositioned &&
+            contentHeightRef.current > 0 &&
+            contentHeightRef.current <= listHeightRef.current
+          ) {
+            revealTail();
+          }
+        }}
+        onContentSizeChange={(_width, height) => {
+          contentHeightRef.current = height;
           if (followRef.current) listRef.current?.scrollToEnd({ animated: false });
+          // The whole page fits the viewport: there is no tail to scroll to,
+          // so reveal at once.
+          if (!tailPositioned && listHeightRef.current > 0 && height <= listHeightRef.current) {
+            revealTail();
+          }
         }}
       />
     );

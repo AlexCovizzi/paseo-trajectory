@@ -1,5 +1,5 @@
 import type { PluginTheme } from "@getpaseo/plugin";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Pressable,
   ScrollView,
@@ -61,6 +61,8 @@ const FADE_STEPS = 16;
 const FOLLOW_THRESHOLD = 16;
 /** Left-edge distance that pages an older stretch of history in. */
 const LOAD_OLDER_THRESHOLD = 80;
+/** Safety reveal for the hidden-until-positioned track. */
+const POSITION_REVEAL_FALLBACK_MS = 400;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -134,6 +136,25 @@ export function TrajectoryTimeline({
   const firstKeyRef = useRef<string | null>(null);
   const eventCountRef = useRef(0);
   const edgesRef = useRef({ left: false, right: false });
+  // The track mounts hidden and is revealed once it sits on the newest
+  // event, so opening never paints the band at its oldest end first.
+  const [positioned, setPositioned] = useState(false);
+  const positionedRef = useRef(false);
+  const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reveal = useCallback(() => {
+    positionedRef.current = true;
+    if (revealTimerRef.current !== null) {
+      clearTimeout(revealTimerRef.current);
+      revealTimerRef.current = null;
+    }
+    setPositioned(true);
+  }, []);
+  useEffect(
+    () => () => {
+      if (revealTimerRef.current !== null) clearTimeout(revealTimerRef.current);
+    },
+    [],
+  );
 
   const events = useMemo<GraphEvent[]>(() => {
     const next: GraphEvent[] = [];
@@ -151,6 +172,22 @@ export function TrajectoryTimeline({
   const pitch = eventCount > 0 ? clamp(usableWidth / eventCount, MIN_PITCH, MAX_PITCH) : MIN_PITCH;
   const markerWidth = clamp(pitch - MARKER_GAP, MIN_MARKER_WIDTH, MAX_MARKER_WIDTH);
   const contentWidth = TRACK_PAD * 2 + eventCount * pitch;
+  const trackMounted = width > 0 && eventCount > 0;
+
+  // Park the track on the newest event before the first paint. The content
+  // width is exact (markers are absolutely placed), so the tail offset is
+  // known without waiting for layout; platforms that apply the scroll
+  // asynchronously are covered by the reveal timer.
+  useLayoutEffect(() => {
+    if (!trackMounted || positionedRef.current) return;
+    if (contentWidth <= trackWidth) {
+      reveal();
+      return;
+    }
+    scrollRef.current?.scrollTo({ x: contentWidth - trackWidth, animated: false });
+    if (revealTimerRef.current !== null) clearTimeout(revealTimerRef.current);
+    revealTimerRef.current = setTimeout(reveal, POSITION_REVEAL_FALLBACK_MS);
+  }, [trackMounted, contentWidth, trackWidth, reveal]);
 
   /** Flips the edge fades on only when a side actually becomes scrollable. */
   const updateEdges = useCallback((x: number, viewport: number, content: number) => {
@@ -172,11 +209,12 @@ export function TrajectoryTimeline({
       followRef.current =
         contentOffset.x + layoutMeasurement.width >= contentSize.width - FOLLOW_THRESHOLD;
       updateEdges(contentOffset.x, layoutMeasurement.width, contentSize.width);
+      if (!positionedRef.current && followRef.current) reveal();
       const nearStart = contentSize.width > layoutMeasurement.width + 1 && contentOffset.x <= LOAD_OLDER_THRESHOLD;
       if (nearStart && !atStartRef.current) onReachStart?.();
       atStartRef.current = nearStart;
     },
-    [onReachStart, updateEdges],
+    [onReachStart, updateEdges, reveal],
   );
 
   const handleContentSizeChange = useCallback(() => {
@@ -184,8 +222,10 @@ export function TrajectoryTimeline({
   }, []);
 
   // Older rows prepend on the left; shift the offset by the width of the added
-  // slots so the viewport stays on the same events instead of jumping.
-  useEffect(() => {
+  // slots so the viewport stays on the same events instead of jumping. Applied
+  // in a layout effect (before paint) so the wider content never flashes at
+  // the old position first.
+  useLayoutEffect(() => {
     const first = events[0]?.row.key ?? null;
     const previousFirst = firstKeyRef.current;
     const previousCount = eventCountRef.current;
@@ -193,7 +233,7 @@ export function TrajectoryTimeline({
       const added = eventCount - previousCount;
       const target = Math.max(0, scrollXRef.current + added * pitch);
       scrollXRef.current = target;
-      setTimeout(() => scrollRef.current?.scrollTo({ x: target, animated: false }), 0);
+      scrollRef.current?.scrollTo({ x: target, animated: false });
     }
     firstKeyRef.current = first;
     eventCountRef.current = eventCount;
@@ -218,11 +258,11 @@ export function TrajectoryTimeline({
           ))}
         </View>
         <View style={styles.trackWrap}>
-        {width > 0 && eventCount > 0 ? (
+        {trackMounted ? (
           <ScrollView
             ref={scrollRef}
             horizontal
-            style={styles.track}
+            style={[styles.track, positioned ? null : styles.hidden]}
             showsHorizontalScrollIndicator={false}
             scrollEventThrottle={16}
             onScroll={handleScroll}
@@ -294,10 +334,10 @@ export function TrajectoryTimeline({
             </View>
           </ScrollView>
         ) : null}
-          {edges.left ? (
+          {edges.left && positioned ? (
             <EdgeFade side="left" color={theme.colors.surface1} height={bandHeight} />
           ) : null}
-          {edges.right ? (
+          {edges.right && positioned ? (
             <EdgeFade side="right" color={theme.colors.surface1} height={bandHeight} />
           ) : null}
         </View>
@@ -370,6 +410,8 @@ function createStyles(theme: PluginTheme) {
       height: BAND_PAD * 2 + LANES.length * ROW_HEIGHT,
     } satisfies ViewStyle,
     track: { flex: 1 } satisfies ViewStyle,
+    // Track pre-positioning: never paint the band at its oldest end first.
+    hidden: { opacity: 0 } satisfies ViewStyle,
     marker: { position: "absolute", borderRadius: 1 } satisfies ViewStyle,
     markerRing: { position: "absolute", borderRadius: 2 } satisfies ViewStyle,
     tooltip: {
